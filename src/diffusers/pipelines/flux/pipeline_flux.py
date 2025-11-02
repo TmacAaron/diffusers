@@ -1008,6 +1008,7 @@ class FluxPipeline(
 
         # Offload all models
         self.maybe_free_model_hooks()
+        self.image_rotary_emb = None
 
         if not return_dict:
             return (image,)

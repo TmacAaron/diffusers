@@ -650,6 +650,11 @@ class WanPipeline(DiffusionPipeline, WanLoraLoaderMixin):
         # Offload all models
         self.maybe_free_model_hooks()
 
+
+        self.transformer.rotary_emb = None
+        if self.transformer_2 is not None:
+            self.transformer_2.rotary_emb = None
+
         if not return_dict:
             return (video,)
 
