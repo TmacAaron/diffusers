@@ -613,6 +613,7 @@ class WanTransformer3DModel(
         self.scale_shift_table = nn.Parameter(torch.randn(1, 2, inner_dim) / inner_dim**0.5)
 
         self.gradient_checkpointing = False
+        self.rotary_emb = None
 
     def forward(
         self,
@@ -644,7 +645,8 @@ class WanTransformer3DModel(
         post_patch_height = height // p_h
         post_patch_width = width // p_w
 
-        rotary_emb = self.rope(hidden_states)
+        if self.rotary_emb is None:
+            self.rotary_emb = self.rope(hidden_states)
 
         hidden_states = self.patch_embedding(hidden_states)
         hidden_states = hidden_states.flatten(2).transpose(1, 2)
@@ -673,11 +675,11 @@ class WanTransformer3DModel(
         if torch.is_grad_enabled() and self.gradient_checkpointing:
             for block in self.blocks:
                 hidden_states = self._gradient_checkpointing_func(
-                    block, hidden_states, encoder_hidden_states, timestep_proj, rotary_emb
+                    block, hidden_states, encoder_hidden_states, timestep_proj, self.rotary_emb
                 )
         else:
             for block in self.blocks:
-                hidden_states = block(hidden_states, encoder_hidden_states, timestep_proj, rotary_emb)
+                hidden_states = block(hidden_states, encoder_hidden_states, timestep_proj, self.rotary_emb)
 
         # 5. Output norm, projection & unpatchify
         if temb.ndim == 3:
