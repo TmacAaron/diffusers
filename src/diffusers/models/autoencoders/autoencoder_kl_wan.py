@@ -1132,6 +1132,9 @@ class AutoencoderKLWan(ModelMixin, AutoencoderMixin, ConfigMixin, FromOriginalMo
             world_size = dist.get_world_size()
 
         if world_size <= 1 or world_size > dist.get_world_size():
+            logger.warning(
+                f"Supported world_size for vae dp is between 2 - {dist.get_world_size}, but got {world_size}. " \
+                f"Fall back to normal vae")
             return
 
         if hw_splits is None:
@@ -1229,6 +1232,9 @@ class AutoencoderKLWan(ModelMixin, AutoencoderMixin, ConfigMixin, FromOriginalMo
         self.clear_cache()
         if self.config.patch_size is not None:
             x = patchify(x, patch_size=self.config.patch_size)
+
+        if self.use_dp:
+            return self.tiled_encode_with_dp(x)
 
         if self.use_tiling and (width > self.tile_sample_min_width or height > self.tile_sample_min_height):
             return self.tiled_encode(x)
@@ -1499,6 +1505,134 @@ class AutoencoderKLWan(ModelMixin, AutoencoderMixin, ConfigMixin, FromOriginalMo
             return (dec,)
         return DecoderOutput(sample=dec)
 
+    def tiled_encode_with_dp(self, x: torch.Tensor) -> AutoencoderKLOutput:
+        r"""Encode a batch of images using a tiled encoder.
+
+        Args:
+            x (`torch.Tensor`): Input batch of videos.
+
+        Returns:
+            `torch.Tensor`:
+                The latent representation of the encoded videos.
+        """
+        _, _, num_frames, height, width = x.shape
+        device = x.device
+        latent_height = height // self.spatial_compression_ratio
+        latent_width = width // self.spatial_compression_ratio
+
+        # Calculate stride based on h_split and w_split
+        tile_latent_stride_height = int((latent_height + self.h_split - 1) / self.h_split)
+        tile_latent_stride_width = int((latent_width + self.w_split - 1) / self.w_split)
+
+        # Calculate overlap in latent space
+        overlap_latent_height = 3
+        overlap_latent_width = 3
+        if self.overlap_pixels is not None:
+            overlap_latent = (self.overlap_pixels + self.spatial_compression_ratio - 1) // self.spatial_compression_ratio
+            overlap_latent_height = overlap_latent
+            overlap_latent_width = overlap_latent
+        elif self.overlap_ratio is not None:
+            overlap_latent_height = int(self.overlap_ratio * latent_height)
+            overlap_latent_width = int(self.overlap_ratio * latent_width)
+
+        # Calculate minimum tile size in latent space
+        tile_latent_min_height = tile_latent_stride_height + overlap_latent_height
+        tile_latent_min_width = tile_latent_stride_width + overlap_latent_width
+
+        blend_height = tile_latent_min_height - tile_latent_stride_height
+        blend_width = tile_latent_min_width - tile_latent_stride_width
+
+        tile_sample_min_height = tile_latent_min_height * self.spatial_compression_ratio
+        tile_sample_min_width = tile_latent_min_width * self.spatial_compression_ratio
+        tile_sample_stride_height = tile_latent_stride_height * self.spatial_compression_ratio
+        tile_sample_stride_width = tile_latent_stride_width * self.spatial_compression_ratio
+
+        # Determine tile grid dimensions - patch_ranks shape is [h_split, w_split]
+        num_tile_rows = self.h_split
+        num_tile_cols = self.w_split
+
+        # Split x into overlapping tiles and encode them separately.
+        # The tiles have an overlap to avoid seams between tiles.
+        local_tiles = []
+        local_hw_shapes = []
+
+        for h_idx, w_idx in self.tile_idxs_per_rank[self.rank]:
+            self.clear_cache()
+            patch_height_start = h_idx * tile_sample_stride_height
+            patch_height_end = patch_height_start + tile_sample_min_height
+            patch_width_start = w_idx * tile_sample_stride_width
+            patch_width_end = patch_width_start + tile_sample_min_width
+            time = []
+            frame_range = 1 + (num_frames - 1) // 4
+            for k in range(frame_range):
+                self._enc_conv_idx = [0]
+                if k == 0:
+                    tile = x[:, :, :1, patch_height_start : patch_height_end, patch_width_start : patch_width_end]
+                else:
+                    tile = x[
+                        :,
+                        :,
+                        1 + 4 * (k - 1) : 1 + 4 * k,
+                        patch_height_start : patch_height_end,
+                        patch_width_start : patch_width_end,
+                    ]
+                tile = self.encoder(tile, feat_cache=self._enc_feat_map, feat_idx=self._enc_conv_idx)
+                tile = self.quant_conv(tile)
+                time.append(tile)
+            time = torch.cat(time, dim=2)
+            local_tiles.append(time.flatten(3, 4))
+            local_hw_shapes.append(torch.Tensor([*time.shape[3:5]]).to(device).int())
+            self.clear_cache()
+
+        # concat all tiles on local rank
+        local_tiles = torch.cat(local_tiles, dim=3)
+        local_hw_shapes = torch.stack(local_hw_shapes)
+
+        # get all hw shapes for each rank (perhaps has different shapes for last tile)
+        gathered_shape_list = [torch.empty((num_tiles, 2), dtype=local_hw_shapes.dtype, device=device) 
+                        for num_tiles in self.num_tiles_per_rank]
+        dist.all_gather(gathered_shape_list, local_hw_shapes, group=self.vae_dp_group)
+
+        # gather tiles on all ranks
+        b, c, n = local_tiles.shape[:3]
+        gathered_tiles = [
+            torch.empty(
+                (b, c, n, tiles_shape.prod(dim=1).sum().item()), 
+                dtype=local_tiles.dtype, device=device) for tiles_shape in gathered_shape_list
+        ]
+        dist.all_gather(gathered_tiles, local_tiles, group=self.vae_dp_group)
+
+        # put tiles in rows based on tile_idxs_per_rank
+        rows = [[None] * num_tile_cols for _ in range(num_tile_rows)]
+        for rank_idx, tile_idxs in enumerate(self.tile_idxs_per_rank):
+            if not tile_idxs:
+                continue
+            rank_tile_hw_shapes = gathered_shape_list[rank_idx]
+            hw_start_idx = 0
+            # perhaps has more than one tile in each rank, get each by hw_shapes
+            for tile_idx, (h_idx, w_idx) in enumerate(tile_idxs):
+                rank_tile_hw_shape = rank_tile_hw_shapes[tile_idx]
+                hw_end_idx = hw_start_idx + rank_tile_hw_shape.prod().item() # flattend hw
+                rows[h_idx][w_idx] = gathered_tiles[rank_idx][:, :, :, hw_start_idx:hw_end_idx].unflatten(
+                    3, rank_tile_hw_shape.tolist()) # unflatten hw dim
+                hw_start_idx = hw_end_idx
+
+        result_rows = []
+        for i, row in enumerate(rows):
+            result_row = []
+            for j, tile in enumerate(row):
+                # blend the above tile and the left tile
+                # to the current tile and add the current tile to the result row
+                if i > 0:
+                    tile = self.blend_v(rows[i - 1][j], tile, blend_height)
+                if j > 0:
+                    tile = self.blend_h(row[j - 1], tile, blend_width)
+                result_row.append(tile[:, :, :, :tile_latent_stride_height, :tile_latent_stride_width])
+            result_rows.append(torch.cat(result_row, dim=-1))
+
+        enc = torch.cat(result_rows, dim=3)[:, :, :, :latent_height, :latent_width]
+        return enc
+
     def tiled_decode_with_dp(self, z: torch.Tensor, return_dict: bool = True) -> Union[DecoderOutput, torch.Tensor]:
         r"""
         Decode a batch of images using a tiled decoder.
@@ -1543,32 +1677,26 @@ class AutoencoderKLWan(ModelMixin, AutoencoderMixin, ConfigMixin, FromOriginalMo
         tile_sample_stride_height = tile_latent_stride_height * self.spatial_compression_ratio
         tile_sample_stride_width = tile_latent_stride_width * self.spatial_compression_ratio
 
-        self.tile_sample_min_height = tile_sample_min_height
-        self.tile_sample_min_width = tile_sample_min_width
-        self.tile_sample_stride_height = tile_sample_stride_height
-        self.tile_sample_stride_width = tile_sample_stride_width
-
         if self.config.patch_size is not None:
             sample_height = sample_height // self.config.patch_size
             sample_width = sample_width // self.config.patch_size
             tile_sample_stride_height = tile_sample_stride_height // self.config.patch_size
             tile_sample_stride_width = tile_sample_stride_width // self.config.patch_size
-            blend_height = self.tile_sample_min_height // self.config.patch_size - tile_sample_stride_height
-            blend_width = self.tile_sample_min_width // self.config.patch_size - tile_sample_stride_width
+            blend_height = tile_sample_min_height // self.config.patch_size - tile_sample_stride_height
+            blend_width = tile_sample_min_width // self.config.patch_size - tile_sample_stride_width
         else:
-            blend_height = self.tile_sample_min_height - tile_sample_stride_height
-            blend_width = self.tile_sample_min_width - tile_sample_stride_width
+            blend_height = tile_sample_min_height - tile_sample_stride_height
+            blend_width = tile_sample_min_width - tile_sample_stride_width
 
-        # Split z into overlapping tiles and decode them separately.
-        # The tiles have an overlap to avoid seams between tiles.
         # Determine tile grid dimensions - patch_ranks shape is [h_split, w_split]
         num_tile_rows = self.h_split
         num_tile_cols = self.w_split
 
+        # Split z into overlapping tiles and decode them separately.
+        # The tiles have an overlap to avoid seams between tiles.
         # Each rank computes only tiles assigned to it based on tile_idxs_per_rank
-        # local_tiles = []  # List to store tiles computed by this rank
-        local_tiles = []
-        local_hw_shapes = []
+        local_tiles = [] # List to store tiles computed by this rank
+        local_hw_shapes = [] # List to store shapes of tiles by this rank
         
         for h_idx, w_idx in self.tile_idxs_per_rank[self.rank]:
             self.clear_cache()
@@ -1611,6 +1739,8 @@ class AutoencoderKLWan(ModelMixin, AutoencoderMixin, ConfigMixin, FromOriginalMo
         # put tiles in rows based on tile_idxs_per_rank
         rows = [[None] * num_tile_cols for _ in range(num_tile_rows)]
         for rank_idx, tile_idxs in enumerate(self.tile_idxs_per_rank):
+            if not tile_idxs:
+                continue
             rank_tile_hw_shapes = gathered_shape_list[rank_idx]
             hw_start_idx = 0
             # perhaps has more than one tile in each rank, get each by hw_shapes
