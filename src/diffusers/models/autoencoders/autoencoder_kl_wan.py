@@ -1143,10 +1143,6 @@ class AutoencoderKLWan(ModelMixin, AutoencoderMixin, ConfigMixin, FromOriginalMo
         assert len(hw_splits) == 2, f"'hw_splits' should be a tuple of 2 int, but got length {len(hw_splits)}"
 
         h_split, w_split = map(int, hw_splits)
-        num_tiles = h_split * w_split
-
-        # assert h_split * w_split == world_size, \
-        #     (f"world_size must be {w_split} * {h_split} = {w_split * h_split}, but got {world_size}")
 
         self.use_dp = True
         self.h_split, self.w_split = h_split, w_split
@@ -1533,12 +1529,12 @@ class AutoencoderKLWan(ModelMixin, AutoencoderMixin, ConfigMixin, FromOriginalMo
                 tile = self.quant_conv(tile)
                 time.append(tile)
             time = torch.cat(time, dim=2)
-            local_tiles.append(time.flatten(3, 4))
-            local_hw_shapes.append(torch.Tensor([*time.shape[3:5]]).to(device).int())
+            local_tiles.append(time.flatten(-2, -1))
+            local_hw_shapes.append(torch.Tensor([*time.shape[-2:]]).to(device).int())
             self.clear_cache()
 
         # concat all tiles on local rank
-        local_tiles = torch.cat(local_tiles, dim=3)
+        local_tiles = torch.cat(local_tiles, dim=-1)
         local_hw_shapes = torch.stack(local_hw_shapes)
 
         # get all hw shapes for each rank (perhaps has different shapes for last tile)
@@ -1547,10 +1543,10 @@ class AutoencoderKLWan(ModelMixin, AutoencoderMixin, ConfigMixin, FromOriginalMo
         dist.all_gather(gathered_shape_list, local_hw_shapes, group=self.vae_dp_group)
 
         # gather tiles on all ranks
-        b, c, n = local_tiles.shape[:3]
+        bcn_ = local_tiles.shape[:-1]
         gathered_tiles = [
             torch.empty(
-                (b, c, n, tiles_shape.prod(dim=1).sum().item()), 
+                (*bcn_, tiles_shape.prod(dim=1).sum().item()), 
                 dtype=local_tiles.dtype, device=device) for tiles_shape in gathered_shape_list
         ]
         dist.all_gather(gathered_tiles, local_tiles, group=self.vae_dp_group)
@@ -1567,7 +1563,7 @@ class AutoencoderKLWan(ModelMixin, AutoencoderMixin, ConfigMixin, FromOriginalMo
                 rank_tile_hw_shape = rank_tile_hw_shapes[tile_idx]
                 hw_end_idx = hw_start_idx + rank_tile_hw_shape.prod().item() # flattend hw
                 rows[h_idx][w_idx] = gathered_tiles[rank_idx][:, :, :, hw_start_idx:hw_end_idx].unflatten(
-                    3, rank_tile_hw_shape.tolist()) # unflatten hw dim
+                    -1, rank_tile_hw_shape.tolist()) # unflatten hw dim
                 hw_start_idx = hw_end_idx
 
         result_rows = []
@@ -1667,12 +1663,12 @@ class AutoencoderKLWan(ModelMixin, AutoencoderMixin, ConfigMixin, FromOriginalMo
                 )
                 time.append(decoded)
             time = torch.cat(time, dim=2)
-            local_tiles.append(time.flatten(3, 4)) # flatten h,w dim for concate all tiles in one rank
-            local_hw_shapes.append(torch.Tensor([*time.shape[3:5]]).to(device).int()) # record hw for futher unflatten
+            local_tiles.append(time.flatten(-2, -1)) # flatten h,w dim for concate all tiles in one rank
+            local_hw_shapes.append(torch.Tensor([*time.shape[-2:]]).to(device).int()) # record hw for futher unflatten
             self.clear_cache()
 
         # concat all tiles on local rank
-        local_tiles = torch.cat(local_tiles, dim=3)
+        local_tiles = torch.cat(local_tiles, dim=-1)
         local_hw_shapes = torch.stack(local_hw_shapes)
 
         # get all hw shapes for each rank (perhaps has different shapes for last tile)
@@ -1681,10 +1677,10 @@ class AutoencoderKLWan(ModelMixin, AutoencoderMixin, ConfigMixin, FromOriginalMo
         dist.all_gather(gathered_shape_list, local_hw_shapes, group=self.vae_dp_group)
 
         # gather tiles on all ranks
-        b, c, n = local_tiles.shape[:3]
+        bcn_ = local_tiles.shape[:-1]
         gathered_tiles = [
             torch.empty(
-                (b, c, n, tiles_shape.prod(dim=1).sum().item()), 
+                (*bcn_, tiles_shape.prod(dim=1).sum().item()), 
                 dtype=local_tiles.dtype, device=device) for tiles_shape in gathered_shape_list
         ]
         dist.all_gather(gathered_tiles, local_tiles, group=self.vae_dp_group)
@@ -1700,7 +1696,7 @@ class AutoencoderKLWan(ModelMixin, AutoencoderMixin, ConfigMixin, FromOriginalMo
             for tile_idx, (h_idx, w_idx) in enumerate(tile_idxs):
                 rank_tile_hw_shape = rank_tile_hw_shapes[tile_idx]
                 hw_end_idx = hw_start_idx + rank_tile_hw_shape.prod().item() # flattend hw
-                rows[h_idx][w_idx] = gathered_tiles[rank_idx][:, :, :, hw_start_idx:hw_end_idx].unflatten(
+                rows[h_idx][w_idx] = gathered_tiles[rank_idx][..., hw_start_idx:hw_end_idx].unflatten(
                     3, rank_tile_hw_shape.tolist()) # unflatten hw dim
                 hw_start_idx = hw_end_idx
 
