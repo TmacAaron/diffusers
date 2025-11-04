@@ -1169,53 +1169,6 @@ class AutoencoderKLWan(ModelMixin, AutoencoderMixin, ConfigMixin, FromOriginalMo
                 self.num_tiles_per_rank[rank_idx] += 1
                 rank_idx += 1
 
-    def enable_dp(
-        self,
-        world_size: Optional[int] = None,
-        hw_splits: Optional[Tuple[int, int]] = None,
-        overlap_ratio: Optional[float] = None,
-        overlap_pixels: Optional[int] = None
-    ) -> None:
-        r"""
-        """
-        if world_size is None:
-            world_size = dist.get_world_size()
-
-        if world_size <= 1 or world_size > dist.get_world_size():
-            return
-
-        if hw_splits is None:
-            hw_splits = (1, int(world_size))
-
-        assert len(hw_splits) == 2, f"'hw_splits' should be a tuple of 2 int, but got length {len(hw_splits)}"
-
-        h_split, w_split = map(int, hw_splits)
-        num_tiles = h_split * w_split
-
-        # assert h_split * w_split == world_size, \
-        #     (f"world_size must be {w_split} * {h_split} = {w_split * h_split}, but got {world_size}")
-
-        self.use_dp = True
-        self.h_split, self.w_split = h_split, w_split
-        self.world_size = world_size
-        self.overlap_ratio = overlap_ratio
-        self.overlap_pixels = overlap_pixels
-
-        dp_ranks = list(range(0, world_size))
-        self.vae_dp_group = dist.new_group(ranks=dp_ranks)
-        self.rank = dist.get_rank()
-        # patch_ranks_flatten = [tile_idx % world_size for tile_idx in range(num_tiles)]
-        # self.patch_ranks = torch.Tensor(patch_ranks_flatten).reshape(h_split, w_split)
-        self.tile_idxs_per_rank = [[] for _ in range(self.world_size)]
-        self.num_tiles_per_rank = [0] * self.world_size
-        rank_idx = 0
-        for h_idx in range(self.h_split):
-            for w_idx in range(self.w_split):
-                rank_idx %= self.world_size
-                self.tile_idxs_per_rank[rank_idx].append((h_idx, w_idx))
-                self.num_tiles_per_rank[rank_idx] += 1
-                rank_idx += 1
-
     def clear_cache(self):
         # Use cached conv counts for decoder and encoder to avoid re-iterating modules each call
         self._conv_num = self._cached_conv_counts["decoder"]
