@@ -721,7 +721,10 @@ class FluxTransformer2DModel(
         if self.image_rotary_emb is None:
             if is_torch_npu_available():
                 freqs_cos, freqs_sin = self.pos_embed(ids.cpu())
-                self.image_rotary_emb = (freqs_cos.npu(), freqs_sin.npu())
+                self.image_rotary_emb = (
+                    freqs_cos.npu().to(hidden_states.dtype),
+                    freqs_sin.npu().to(hidden_states.dtype)
+                )
             else:
                 self.image_rotary_emb = self.pos_embed(ids)
 
