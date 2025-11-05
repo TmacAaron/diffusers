@@ -18,7 +18,6 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.distributed as dist
-import torch.distributed as dist
 
 from ...configuration_utils import ConfigMixin, register_to_config
 from ...loaders import FromOriginalModelMixin
@@ -1077,8 +1076,6 @@ class AutoencoderKLWan(ModelMixin, AutoencoderMixin, ConfigMixin, FromOriginalMo
 
         self.use_dp = False
 
-        self.use_dp = False
-
         # Precompute and cache conv counts for encoder and decoder for clear_cache speedup
         self._cached_conv_counts = {
             "decoder": sum(isinstance(m, WanCausalConv3d) for m in self.decoder.modules())
@@ -1129,7 +1126,7 @@ class AutoencoderKLWan(ModelMixin, AutoencoderMixin, ConfigMixin, FromOriginalMo
         r"""
         """
         if world_size is None:
-            world_size = dist.get_world_size()
+            world_size = dist.get_world_size() if dist.is_initialized() else 1
 
         if world_size <= 1 or world_size > dist.get_world_size():
             logger.warning(
@@ -1236,9 +1233,6 @@ class AutoencoderKLWan(ModelMixin, AutoencoderMixin, ConfigMixin, FromOriginalMo
         _, _, num_frame, height, width = z.shape
         tile_latent_min_height = self.tile_sample_min_height // self.spatial_compression_ratio
         tile_latent_min_width = self.tile_sample_min_width // self.spatial_compression_ratio
-
-        if self.use_dp:
-            return self.tiled_decode_with_dp(z, return_dict=return_dict)
 
         if self.use_dp:
             return self.tiled_decode_with_dp(z, return_dict=return_dict)
