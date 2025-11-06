@@ -122,6 +122,7 @@ from .import_utils import (
     is_wandb_available,
     is_xformers_available,
     is_xformers_version,
+    is_mindie_sd_available,
     requires_backends,
 )
 from .loading_utils import get_module_from_name, get_submodule_by_name, load_image, load_video

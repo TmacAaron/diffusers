@@ -229,6 +229,7 @@ _flash_attn_3_available, _flash_attn_3_version = _is_package_available("flash_at
 _aiter_available, _aiter_version = _is_package_available("aiter")
 _kornia_available, _kornia_version = _is_package_available("kornia")
 _nvidia_modelopt_available, _nvidia_modelopt_version = _is_package_available("modelopt", get_dist_name=True)
+_mindie_sd_available, _mindie_sd_version = _is_package_available("mindiesd")
 
 
 def is_torch_available():
@@ -413,6 +414,9 @@ def is_aiter_available():
 
 def is_kornia_available():
     return _kornia_available
+
+def is_mindie_sd_available():
+    return _mindie_sd_available
 
 
 # docstyle-ignore
