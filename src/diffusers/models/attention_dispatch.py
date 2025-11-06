@@ -983,11 +983,6 @@ def _mindie_sd_laser_attn_forward_op(
     if return_lse:
         raise ValueError("MindIE SD attention backend does not support setting `return_lse=True`.")
 
-    # query, key, value = (x.transpose(1, 2).contiguous() for x in (query, key, value))
-    # print(f"[YYT DEBUG] >>>>>>>> {query.shape=}")
-    # print(f"[YYT DEBUG] >>>>>>>> {key.shape=}")
-    # print(f"[YYT DEBUG] >>>>>>>> {value.shape=}")
-
     out = mindie_sd_attn_forward(
         query,
         key,
@@ -996,8 +991,6 @@ def _mindie_sd_laser_attn_forward_op(
         op_type="ascend_laser_attention",
         layout="BNSD"
     )
-
-    # out = out.transpose(1, 2).contiguous()
 
     return out
 

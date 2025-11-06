@@ -39,6 +39,8 @@ from ..modeling_outputs import Transformer2DModelOutput
 from ..modeling_utils import ModelMixin
 from ..normalization import AdaLayerNormContinuous, AdaLayerNormZero, AdaLayerNormZeroSingle
 
+from mindiesd import attention_forward as mindie_sd_attn_forward
+
 STREAM_VECTOR = torch.npu.Stream()
 STREAM_COMM = torch.npu.Stream()
 
@@ -378,29 +380,39 @@ class FluxAttnProcessor:
             key_all = ulysses_preforward(key, group, world_size, B, S_KV_LOCAL, H, D, H_LOCAL)
         
         value_all = _wait_tensor(value_all)
-        value_all = value_all.reshape(world_size, S_KV_LOCAL, B, H_LOCAL, D).flatten(0, 1).permute(1, 0, 2, 3).transpose(2,1).contiguous()
+        value_all = value_all.reshape(world_size, S_KV_LOCAL, B, H_LOCAL, D).flatten(0, 1).permute(1, 0, 2, 3).contiguous()
 
         query_all = _wait_tensor(query_all)
-        query_all = query_all.reshape(world_size, S_Q_LOCAL, B, H_LOCAL, D).flatten(0, 1).permute(1, 0, 2, 3).transpose(2,1).contiguous()
+        query_all = query_all.reshape(world_size, S_Q_LOCAL, B, H_LOCAL, D).flatten(0, 1).permute(1, 0, 2, 3).contiguous()
 
         key_all = _wait_tensor(key_all)
-        key_all = key_all.reshape(world_size, S_KV_LOCAL, B, H_LOCAL, D).flatten(0, 1).permute(1, 0, 2, 3).transpose(2,1).contiguous()
+        key_all = key_all.reshape(world_size, S_KV_LOCAL, B, H_LOCAL, D).flatten(0, 1).permute(1, 0, 2, 3).contiguous()
 
-        out = npu_fusion_attention(
+        # out = npu_fusion_attention(
+        #     query_all,
+        #     key_all,
+        #     value_all,
+        #     H_LOCAL,  # num_heads
+        #     input_layout="BNSD",
+        #     pse=None,
+        #     scale=1.0 / math.sqrt(D),
+        #     pre_tockens=65536,
+        #     next_tockens=65536,
+        #     keep_prob=1.0,
+        #     sync=False,
+        #     inner_precise=0,
+        # )[0]
+
+        out = mindie_sd_attn_forward(
             query_all,
             key_all,
             value_all,
-            H_LOCAL,  # num_heads
-            input_layout="BNSD",
-            pse=None,
-            scale=1.0 / math.sqrt(D),
-            pre_tockens=65536,
-            next_tockens=65536,
-            keep_prob=1.0,
-            sync=False,
-            inner_precise=0,
-        )[0]
-        out = out.transpose(1, 2).contiguous()
+            opt_mode="manual",
+            op_type="ascend_laser_attention",
+            layout="BNSD"
+        )
+
+        # out = out.transpose(1, 2).contiguous()
         out = out.reshape(B, world_size, S_Q_LOCAL, H_LOCAL, D).permute(1, 3, 0, 2, 4).contiguous()
         out = _all_to_all_single(out, group)
         hidden_states = out.flatten(0, 1).permute(1, 2, 0, 3).contiguous()

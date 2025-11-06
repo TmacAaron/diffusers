@@ -538,7 +538,7 @@ class WanTransformerBlock(nn.Module):
             eps=eps,
             added_kv_proj_dim=added_kv_proj_dim,
             cross_attention_dim_head=dim // num_heads,
-            processor=WanAttnProcessor(),
+            processor=WanAttnProcessorNPU(),
         )
         self.norm2 = FP32LayerNorm(dim, eps, elementwise_affine=True) if cross_attn_norm else nn.Identity()
 
