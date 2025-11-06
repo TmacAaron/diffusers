@@ -14,6 +14,7 @@
 
 import html
 from typing import Any, Callable, Dict, List, Optional, Tuple, Union
+import time
 
 import PIL
 import regex as re
@@ -356,6 +357,15 @@ class WanImageToVideoPipeline(DiffusionPipeline, WanLoraLoaderMixin):
         if height % 16 != 0 or width % 16 != 0:
             raise ValueError(f"`height` and `width` have to be divisible by 16 but are {height} and {width}.")
 
+        if getattr(getattr(self.transformer, "_parallel_config", None), "context_parallel_config", None) is not None:
+            mesh_size = self.transformer._parallel_config.context_parallel_config._flattened_mesh.size()
+            mod_size = 16 * mesh_size
+            if height % mod_size != 0 or width % mod_size != 0:
+                raise ValueError(
+                    f"`height` and `width` have to be divisible by 16 * {mesh_size} " \
+                    f"when enable context parallel, but are {height} and {width}."
+                )
+
         if callback_on_step_end_tensor_inputs is not None and not all(
             k in self._callback_tensor_inputs for k in callback_on_step_end_tensor_inputs
         ):
@@ -613,6 +623,8 @@ class WanImageToVideoPipeline(DiffusionPipeline, WanLoraLoaderMixin):
                 indicating whether the corresponding generated image contains "not-safe-for-work" (nsfw) content.
         """
 
+        t_start = time.time()
+
         if isinstance(callback_on_step_end, (PipelineCallback, MultiPipelineCallbacks)):
             callback_on_step_end_tensor_inputs = callback_on_step_end.tensor_inputs
 
@@ -724,6 +736,7 @@ class WanImageToVideoPipeline(DiffusionPipeline, WanLoraLoaderMixin):
         else:
             boundary_timestep = None
 
+        t_preprocess = time.time()
         with self.progress_bar(total=num_inference_steps) as progress_bar:
             for i, t in enumerate(timesteps):
                 if self.interrupt:
@@ -794,6 +807,8 @@ class WanImageToVideoPipeline(DiffusionPipeline, WanLoraLoaderMixin):
                 if XLA_AVAILABLE:
                     xm.mark_step()
 
+        t_dit = time.time()
+
         self._current_timestep = None
 
         if self.config.expand_timesteps:
@@ -815,8 +830,28 @@ class WanImageToVideoPipeline(DiffusionPipeline, WanLoraLoaderMixin):
         else:
             video = latents
 
+        t_vae = time.time()
+
         # Offload all models
         self.maybe_free_model_hooks()
+
+        self.transformer.rotary_emb = None
+        if self.transformer_2 is not None:
+            self.transformer_2.rotary_emb = None
+
+        is_print = torch.distributed.get_rank() == 0 if torch.distributed.is_initialized() else True
+        if is_print:
+            headers = ["Total", "Prepare", "DIT", "VAE", "DIT_PER_STEP"]
+            time_list = [t_vae - t_start, t_preprocess - t_start, t_dit - t_preprocess, t_vae - t_dit, (t_dit - t_start) / num_inference_steps]
+            time_list = [f"{t:.3f}" for t in time_list]
+            widths = [10, 10, 10, 10, 10]
+            def _fmt_row(values):
+                return " | ".join(str(values[i]).ljust(widths[i]) for i in range(len(headers)))
+
+
+            sep = "-+-".join("-" * w for w in widths)
+            print(_fmt_row(headers))
+            print(_fmt_row(time_list))
 
         if not return_dict:
             return (video,)

@@ -26,6 +26,8 @@ from transformers import (
     T5TokenizerFast,
 )
 
+import time
+
 from ...image_processor import PipelineImageInput, VaeImageProcessor
 from ...loaders import FluxIPAdapterMixin, FluxLoraLoaderMixin, FromSingleFileMixin, TextualInversionLoaderMixin
 from ...models import AutoencoderKL, FluxTransformer2DModel
@@ -680,6 +682,7 @@ class FluxPipeline(
         callback_on_step_end: Optional[Callable[[int, int, Dict], None]] = None,
         callback_on_step_end_tensor_inputs: List[str] = ["latents"],
         max_sequence_length: int = 512,
+        prof=None
     ):
         r"""
         Function invoked when calling the pipeline for generation.
@@ -779,6 +782,10 @@ class FluxPipeline(
             is True, otherwise a `tuple`. When returning a tuple, the first element is a list with the generated
             images.
         """
+        torch.cuda.synchronize()
+        if prof:
+            prof.start()
+        t_start = time.time()
 
         height = height or self.default_sample_size * self.vae_scale_factor
         width = width or self.default_sample_size * self.vae_scale_factor
@@ -925,6 +932,10 @@ class FluxPipeline(
                 batch_size * num_images_per_prompt,
             )
 
+        torch.cuda.synchronize()
+        if prof:
+            prof.step()
+        t_preprocess = time.time()
         # 6. Denoising loop
         # We set the index here to remove DtoH sync, helpful especially during compilation.
         # Check out more details here: https://github.com/huggingface/diffusers/pull/11696
@@ -996,6 +1007,12 @@ class FluxPipeline(
                 if XLA_AVAILABLE:
                     xm.mark_step()
 
+                torch.cuda.synchronize()
+                if prof:
+                    prof.step()
+
+        t_dit = time.time()
+
         self._current_timestep = None
 
         if output_type == "latent":
@@ -1006,9 +1023,29 @@ class FluxPipeline(
             image = self.vae.decode(latents, return_dict=False)[0]
             image = self.image_processor.postprocess(image, output_type=output_type)
 
+        torch.cuda.synchronize()
+        if prof:
+            prof.step()
+
+        t_vae = time.time()
+
         # Offload all models
         self.maybe_free_model_hooks()
         self.image_rotary_emb = None
+
+        is_print = torch.distributed.get_rank() == 0 if torch.distributed.is_initialized() else True
+        if is_print:
+            headers = ["Total", "Prepare", "DIT", "VAE", "DIT_PER_STEP"]
+            time_list = [t_vae - t_start, t_preprocess - t_start, t_dit - t_preprocess, t_vae - t_dit, (t_dit - t_start) / num_inference_steps]
+            time_list = [f"{t:.3f}" for t in time_list]
+            widths = [10, 10, 10, 10, 10]
+            def _fmt_row(values):
+                return " | ".join(str(values[i]).ljust(widths[i]) for i in range(len(headers)))
+
+
+            sep = "-+-".join("-" * w for w in widths)
+            print(_fmt_row(headers))
+            print(_fmt_row(time_list))
 
         if not return_dict:
             return (image,)

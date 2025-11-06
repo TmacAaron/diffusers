@@ -14,6 +14,7 @@
 
 import html
 from typing import Any, Callable, Dict, List, Optional, Union
+import time
 
 import regex as re
 import torch
@@ -473,6 +474,8 @@ class WanPipeline(DiffusionPipeline, WanLoraLoaderMixin):
                 indicating whether the corresponding generated image contains "not-safe-for-work" (nsfw) content.
         """
 
+        t_start = time.time()
+
         if isinstance(callback_on_step_end, (PipelineCallback, MultiPipelineCallbacks)):
             callback_on_step_end_tensor_inputs = callback_on_step_end.tensor_inputs
 
@@ -564,6 +567,8 @@ class WanPipeline(DiffusionPipeline, WanLoraLoaderMixin):
         else:
             boundary_timestep = None
 
+        t_preprocess = time.time()
+
         with self.progress_bar(total=num_inference_steps) as progress_bar:
             for i, t in enumerate(timesteps):
                 if self.interrupt:
@@ -628,6 +633,8 @@ class WanPipeline(DiffusionPipeline, WanLoraLoaderMixin):
 
                 if XLA_AVAILABLE:
                     xm.mark_step()
+    
+        t_dit = time.time()
 
         self._current_timestep = None
 
@@ -647,9 +654,23 @@ class WanPipeline(DiffusionPipeline, WanLoraLoaderMixin):
         else:
             video = latents
 
+        t_vae = time.time()
+
         # Offload all models
         self.maybe_free_model_hooks()
 
+        if torch.distributed.get_rank() == 0:
+            headers = ["Total", "Prepare", "DIT", "VAE", "DIT_PER_STEP"]
+            time_list = [t_vae - t_start, t_preprocess - t_start, t_dit - t_preprocess, t_vae - t_dit, (t_dit - t_start) / num_inference_steps]
+            time_list = [f"{t:.3f}" for t in time_list]
+            widths = [10, 10, 10, 10, 10]
+            def _fmt_row(values):
+                return " | ".join(str(values[i]).ljust(widths[i]) for i in range(len(headers)))
+
+
+            sep = "-+-".join("-" * w for w in widths)
+            print(_fmt_row(headers))
+            print(_fmt_row(time_list))
 
         self.transformer.rotary_emb = None
         if self.transformer_2 is not None:
