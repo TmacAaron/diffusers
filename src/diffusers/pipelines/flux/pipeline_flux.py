@@ -28,6 +28,8 @@ from transformers import (
 
 import time
 
+import time
+
 from ...image_processor import PipelineImageInput, VaeImageProcessor
 from ...loaders import FluxIPAdapterMixin, FluxLoraLoaderMixin, FromSingleFileMixin, TextualInversionLoaderMixin
 from ...models import AutoencoderKL, FluxTransformer2DModel
@@ -1007,10 +1009,10 @@ class FluxPipeline(
                 if XLA_AVAILABLE:
                     xm.mark_step()
 
-                torch.cuda.synchronize()
                 if prof:
                     prof.step()
 
+        torch.cuda.synchronize()
         t_dit = time.time()
 
         self._current_timestep = None

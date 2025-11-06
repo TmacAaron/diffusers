@@ -542,6 +542,7 @@ class WanImageToVideoPipeline(DiffusionPipeline, WanLoraLoaderMixin):
         ] = None,
         callback_on_step_end_tensor_inputs: List[str] = ["latents"],
         max_sequence_length: int = 512,
+        prof=None,
     ):
         r"""
         The call function to the pipeline for generation.
@@ -623,7 +624,10 @@ class WanImageToVideoPipeline(DiffusionPipeline, WanLoraLoaderMixin):
                 indicating whether the corresponding generated image contains "not-safe-for-work" (nsfw) content.
         """
 
+        torch.cuda.synchronize()
         t_start = time.time()
+        if prof:
+            prof.start()
 
         if isinstance(callback_on_step_end, (PipelineCallback, MultiPipelineCallbacks)):
             callback_on_step_end_tensor_inputs = callback_on_step_end.tensor_inputs
@@ -736,7 +740,11 @@ class WanImageToVideoPipeline(DiffusionPipeline, WanLoraLoaderMixin):
         else:
             boundary_timestep = None
 
+        torch.cuda.synchronize()
         t_preprocess = time.time()
+        if prof:
+            prof.step()
+
         with self.progress_bar(total=num_inference_steps) as progress_bar:
             for i, t in enumerate(timesteps):
                 if self.interrupt:
@@ -807,6 +815,10 @@ class WanImageToVideoPipeline(DiffusionPipeline, WanLoraLoaderMixin):
                 if XLA_AVAILABLE:
                     xm.mark_step()
 
+                if prof:
+                    prof.step()
+
+        torch.cuda.synchronize()
         t_dit = time.time()
 
         self._current_timestep = None
@@ -830,7 +842,11 @@ class WanImageToVideoPipeline(DiffusionPipeline, WanLoraLoaderMixin):
         else:
             video = latents
 
+        torch.cuda.synchronize()
         t_vae = time.time()
+        if prof:
+            prof.step()
+            prof.stop()
 
         # Offload all models
         self.maybe_free_model_hooks()
