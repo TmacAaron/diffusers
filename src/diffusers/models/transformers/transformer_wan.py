@@ -18,6 +18,7 @@ from typing import Any, Dict, Optional, Tuple, Union
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from mindiesd import rotary_position_embedding
 
 from ...configuration_utils import ConfigMixin, register_to_config
 from ...loaders import FromOriginalModelMixin, PeftAdapterMixin
@@ -196,18 +197,26 @@ class WanAttnProcessor:
 
         if rotary_emb is not None:
 
+            # def apply_rotary_emb(
+            #     hidden_states: torch.Tensor,
+            #     freqs_cos: torch.Tensor,
+            #     freqs_sin: torch.Tensor,
+            # ):
+            #     x1, x2 = hidden_states.unflatten(-1, (-1, 2)).unbind(-1)
+            #     cos = freqs_cos[..., 0::2]
+            #     sin = freqs_sin[..., 1::2]
+            #     out = torch.empty_like(hidden_states)
+            #     out[..., 0::2] = x1 * cos - x2 * sin
+            #     out[..., 1::2] = x1 * sin + x2 * cos
+            #     return out.type_as(hidden_states)
+
             def apply_rotary_emb(
                 hidden_states: torch.Tensor,
                 freqs_cos: torch.Tensor,
                 freqs_sin: torch.Tensor,
             ):
-                x1, x2 = hidden_states.unflatten(-1, (-1, 2)).unbind(-1)
-                cos = freqs_cos[..., 0::2]
-                sin = freqs_sin[..., 1::2]
-                out = torch.empty_like(hidden_states)
-                out[..., 0::2] = x1 * cos - x2 * sin
-                out[..., 1::2] = x1 * sin + x2 * cos
-                return out.type_as(hidden_states)
+                out = rotary_position_embedding(hidden_states, freqs_cos, freqs_sin, rotated_mode="rotated_interleaved", fused=True)
+                return out
 
             query = apply_rotary_emb(query, *rotary_emb)
             key = apply_rotary_emb(key, *rotary_emb)

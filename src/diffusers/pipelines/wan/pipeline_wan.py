@@ -668,7 +668,6 @@ class WanPipeline(DiffusionPipeline, WanLoraLoaderMixin):
         torch.cuda.synchronize()
         if prof:
             prof.step()
-            prof.stop()
         t_vae = time.time()
 
         # Offload all models
