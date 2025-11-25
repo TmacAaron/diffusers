@@ -266,7 +266,7 @@ class _AttentionBackendRegistry:
     def _is_context_parallel_enabled(
         cls, backend: AttentionBackendName, parallel_config: Optional["ParallelConfig"]
     ) -> bool:
-        supports_context_parallel = backend in cls._supports_context_parallel
+        supports_context_parallel = backend in cls._supports_context_parallel and cls._supports_context_parallel[backend]
         is_degree_greater_than_1 = parallel_config is not None and (
             parallel_config.context_parallel_config.ring_degree > 1
             or parallel_config.context_parallel_config.ulysses_degree > 1
@@ -1170,6 +1170,7 @@ class TemplatedUlyssesAttention(torch.autograd.Function):
         backward_op,
         _parallel_config: Optional["ParallelConfig"] = None,
     ):
+        # print(f"[YYT DEBUG] >>>>> ulysses")
         ulysses_mesh = _parallel_config.context_parallel_config._ulysses_mesh
         world_size = _parallel_config.context_parallel_config.ulysses_degree
         group = ulysses_mesh.get_group()
@@ -1820,6 +1821,7 @@ def _native_math_attention(
 @_AttentionBackendRegistry.register(
     AttentionBackendName._NATIVE_NPU,
     constraints=[_check_device, _check_qkv_dtype_bf16_or_fp16, _check_shape],
+    supports_context_parallel=True,
 )
 def _native_npu_attention(
     query: torch.Tensor,
@@ -2144,6 +2146,7 @@ def _xformers_attention(
 @_AttentionBackendRegistry.register(
     AttentionBackendName._MINDIE_SD_LASER,
     constraints=[_check_device, _check_qkv_dtype_bf16_or_fp16, _check_shape],
+    supports_context_parallel=True,
 )
 def _mindie_sd_laser_attention(
     query: torch.Tensor,

@@ -37,6 +37,10 @@ from ..normalization import FP32LayerNorm
 logger = logging.get_logger(__name__)  # pylint: disable=invalid-name
 
 
+if torch.distributed.is_available():
+    import torch.distributed._functional_collectives as funcol
+
+
 def _get_qkv_projections(attn: "WanAttention", hidden_states: torch.Tensor, encoder_hidden_states: torch.Tensor):
     # encoder_hidden_states is only passed for cross-attention
     if encoder_hidden_states is None:
@@ -64,6 +68,234 @@ def _get_added_kv_projections(attn: "WanAttention", encoder_hidden_states_img: t
         key_img = attn.add_k_proj(encoder_hidden_states_img)
         value_img = attn.add_v_proj(encoder_hidden_states_img)
     return key_img, value_img
+
+
+def _wait_tensor(tensor):
+    if isinstance(tensor, funcol.AsyncCollectiveTensor):
+        tensor = tensor.wait()
+    return tensor
+
+
+def _all_to_all_single(x: torch.Tensor, group) -> torch.Tensor:
+    shape = x.shape
+    x = x.flatten()
+    x = funcol.all_to_all_single(x, None, None, group)
+    x = x.reshape(shape)
+    x = _wait_tensor(x)
+    return x
+
+
+def ulysses_preforward(
+    x: torch.Tensor,
+    group,
+    world_size,
+    B, 
+    S_LOCAL, 
+    H, 
+    D, 
+    H_LOCAL
+):
+    x = x.reshape(B, S_LOCAL, world_size, H_LOCAL, D).permute(2, 1, 0, 3, 4).contiguous()
+    x = x.flatten()
+    x = funcol.all_to_all_single(x, None, None, group)
+    return x
+
+
+class WanAttnProcessorSP:
+    _attention_backend = None
+    _parallel_config = None
+
+    def __init__(self):
+        if not hasattr(F, "scaled_dot_product_attention"):
+            raise ImportError(
+                "WanAttnProcessor requires PyTorch 2.0. To use it, please upgrade PyTorch to version 2.0 or higher."
+            )
+
+    def __call__(
+        self,
+        attn: "WanAttention",
+        hidden_states: torch.Tensor,
+        encoder_hidden_states: Optional[torch.Tensor] = None,
+        attention_mask: Optional[torch.Tensor] = None,
+        rotary_emb: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+    ) -> torch.Tensor:
+        encoder_hidden_states_img = None
+        if attn.add_k_proj is not None:
+            # 512 is the context length of the text encoder, hardcoded for now
+            image_context_length = encoder_hidden_states.shape[1] - 512
+            encoder_hidden_states_img = encoder_hidden_states[:, :image_context_length]
+            encoder_hidden_states = encoder_hidden_states[:, image_context_length:]
+
+        if encoder_hidden_states is None:
+            encoder_hidden_states = hidden_states
+
+        ulysses_mesh = self._parallel_config.context_parallel_config._ulysses_mesh
+        world_size = self._parallel_config.context_parallel_config.ulysses_degree
+        group = ulysses_mesh.get_group()
+
+        # query, key, value = _get_qkv_projections(attn, hidden_states, encoder_hidden_states)
+        value = attn.to_v(encoder_hidden_states)
+        value = value.unflatten(2, (attn.heads, -1))
+        B, S_KV_LOCAL, H, D = value.shape
+        H_LOCAL = H // world_size
+        value_all = ulysses_preforward(value, group, world_size, B, S_KV_LOCAL, H, D, H_LOCAL)
+
+
+        def apply_rotary_emb(
+            hidden_states: torch.Tensor,
+            freqs_cos: torch.Tensor,
+            freqs_sin: torch.Tensor,
+        ):
+            out = rotary_position_embedding(hidden_states, freqs_cos, freqs_sin, rotated_mode="rotated_interleaved", fused=True)
+            return out
+
+        query = attn.to_q(hidden_states)
+        query = attn.norm_q(query)
+        query = query.unflatten(2, (attn.heads, -1))
+        if rotary_emb is not None:
+            query = apply_rotary_emb(query, *rotary_emb)
+        _, S_Q_LOCAL, _, _ = query.shape
+        query_all = ulysses_preforward(query, group, world_size, B, S_Q_LOCAL, H, D, H_LOCAL)
+
+        key = attn.to_k(encoder_hidden_states)
+        key = attn.norm_k(key)
+        key = key.unflatten(2, (attn.heads, -1))
+        if rotary_emb is not None:
+            key = apply_rotary_emb(key, *rotary_emb)
+        key_all = ulysses_preforward(key, group, world_size, B, S_KV_LOCAL, H, D, H_LOCAL)
+
+        value_all = _wait_tensor(value_all)
+        value_all = value_all.reshape(world_size, S_KV_LOCAL, B, H_LOCAL, D).flatten(0, 1).permute(1, 0, 2, 3).contiguous()
+
+        query_all = _wait_tensor(query_all)
+        query_all = query_all.reshape(world_size, S_Q_LOCAL, B, H_LOCAL, D).flatten(0, 1).permute(1, 0, 2, 3).contiguous()
+
+        key_all = _wait_tensor(key_all)
+        key_all = key_all.reshape(world_size, S_KV_LOCAL, B, H_LOCAL, D).flatten(0, 1).permute(1, 0, 2, 3).contiguous()
+
+        hidden_states = dispatch_attention_fn(
+            query_all,
+            key_all,
+            value_all,
+            attn_mask=attention_mask,
+            dropout_p=0.0,
+            is_causal=False,
+            backend=self._attention_backend,
+            parallel_config=None,
+        )
+        hidden_states = hidden_states.reshape(B, world_size, S_Q_LOCAL, H_LOCAL, D).permute(1, 3, 0, 2, 4).contiguous()
+        hidden_states = _all_to_all_single(hidden_states, group)
+        hidden_states = hidden_states.flatten(0, 1).permute(1, 2, 0, 3).contiguous()
+
+        hidden_states = hidden_states.flatten(2, 3)
+        hidden_states = hidden_states.type_as(query)
+
+        hidden_states = attn.to_out[0](hidden_states)
+        hidden_states = attn.to_out[1](hidden_states)
+        return hidden_states
+
+
+class WanAttnProcessorCross:
+    _attention_backend_fix = "_native_npu"
+    _parallel_config = None
+
+    def __init__(self):
+        if not hasattr(F, "scaled_dot_product_attention"):
+            raise ImportError(
+                "WanAttnProcessor requires PyTorch 2.0. To use it, please upgrade PyTorch to version 2.0 or higher."
+            )
+
+    def __call__(
+        self,
+        attn: "WanAttention",
+        hidden_states: torch.Tensor,
+        encoder_hidden_states: Optional[torch.Tensor] = None,
+        attention_mask: Optional[torch.Tensor] = None,
+        rotary_emb: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+    ) -> torch.Tensor:
+        encoder_hidden_states_img = None
+        if attn.add_k_proj is not None:
+            # 512 is the context length of the text encoder, hardcoded for now
+            image_context_length = encoder_hidden_states.shape[1] - 512
+            encoder_hidden_states_img = encoder_hidden_states[:, :image_context_length]
+            encoder_hidden_states = encoder_hidden_states[:, image_context_length:]
+
+        query, key, value = _get_qkv_projections(attn, hidden_states, encoder_hidden_states)
+
+        query = attn.norm_q(query)
+        key = attn.norm_k(key)
+
+        query = query.unflatten(2, (attn.heads, -1))
+        key = key.unflatten(2, (attn.heads, -1))
+        value = value.unflatten(2, (attn.heads, -1))
+
+        if rotary_emb is not None:
+
+            # def apply_rotary_emb(
+            #     hidden_states: torch.Tensor,
+            #     freqs_cos: torch.Tensor,
+            #     freqs_sin: torch.Tensor,
+            # ):
+            #     x1, x2 = hidden_states.unflatten(-1, (-1, 2)).unbind(-1)
+            #     cos = freqs_cos[..., 0::2]
+            #     sin = freqs_sin[..., 1::2]
+            #     out = torch.empty_like(hidden_states)
+            #     out[..., 0::2] = x1 * cos - x2 * sin
+            #     out[..., 1::2] = x1 * sin + x2 * cos
+            #     return out.type_as(hidden_states)
+
+            def apply_rotary_emb(
+                hidden_states: torch.Tensor,
+                freqs_cos: torch.Tensor,
+                freqs_sin: torch.Tensor,
+            ):
+                out = rotary_position_embedding(hidden_states, freqs_cos, freqs_sin, rotated_mode="rotated_interleaved", fused=True)
+                return out
+
+            query = apply_rotary_emb(query, *rotary_emb)
+            key = apply_rotary_emb(key, *rotary_emb)
+
+        # I2V task
+        hidden_states_img = None
+        if encoder_hidden_states_img is not None:
+            key_img, value_img = _get_added_kv_projections(attn, encoder_hidden_states_img)
+            key_img = attn.norm_added_k(key_img)
+
+            key_img = key_img.unflatten(2, (attn.heads, -1))
+            value_img = value_img.unflatten(2, (attn.heads, -1))
+
+            hidden_states_img = dispatch_attention_fn(
+                query,
+                key_img,
+                value_img,
+                attn_mask=None,
+                dropout_p=0.0,
+                is_causal=False,
+                backend=self._attention_backend_fix,
+                parallel_config=None,
+            )
+            hidden_states_img = hidden_states_img.flatten(2, 3)
+            hidden_states_img = hidden_states_img.type_as(query)
+
+        hidden_states = dispatch_attention_fn(
+            query,
+            key,
+            value,
+            attn_mask=attention_mask,
+            dropout_p=0.0,
+            is_causal=False,
+            backend=self._attention_backend_fix,
+            parallel_config=None,
+        )
+        hidden_states = hidden_states.flatten(2, 3)
+        hidden_states = hidden_states.type_as(query)
+
+        if hidden_states_img is not None:
+            hidden_states = hidden_states + hidden_states_img
+
+        hidden_states = attn.to_out[0](hidden_states)
+        hidden_states = attn.to_out[1](hidden_states)
+        return hidden_states
 
 
 class WanAttnProcessorNPU:
@@ -102,18 +334,26 @@ class WanAttnProcessorNPU:
 
         if rotary_emb is not None:
 
+            # def apply_rotary_emb(
+            #     hidden_states: torch.Tensor,
+            #     freqs_cos: torch.Tensor,
+            #     freqs_sin: torch.Tensor,
+            # ):
+            #     x1, x2 = hidden_states.unflatten(-1, (-1, 2)).unbind(-1)
+            #     cos = freqs_cos[..., 0::2]
+            #     sin = freqs_sin[..., 1::2]
+            #     out = torch.empty_like(hidden_states)
+            #     out[..., 0::2] = x1 * cos - x2 * sin
+            #     out[..., 1::2] = x1 * sin + x2 * cos
+            #     return out.type_as(hidden_states)
+
             def apply_rotary_emb(
                 hidden_states: torch.Tensor,
                 freqs_cos: torch.Tensor,
                 freqs_sin: torch.Tensor,
             ):
-                x1, x2 = hidden_states.unflatten(-1, (-1, 2)).unbind(-1)
-                cos = freqs_cos[..., 0::2]
-                sin = freqs_sin[..., 1::2]
-                out = torch.empty_like(hidden_states)
-                out[..., 0::2] = x1 * cos - x2 * sin
-                out[..., 1::2] = x1 * sin + x2 * cos
-                return out.type_as(hidden_states)
+                out = rotary_position_embedding(hidden_states, freqs_cos, freqs_sin, rotated_mode="rotated_interleaved", fused=True)
+                return out
 
             query = apply_rotary_emb(query, *rotary_emb)
             key = apply_rotary_emb(key, *rotary_emb)
@@ -511,6 +751,11 @@ class WanRotaryPosEmbed(nn.Module):
         freqs_cos = torch.cat([freqs_cos_f, freqs_cos_h, freqs_cos_w], dim=-1).reshape(1, ppf * pph * ppw, 1, -1)
         freqs_sin = torch.cat([freqs_sin_f, freqs_sin_h, freqs_sin_w], dim=-1).reshape(1, ppf * pph * ppw, 1, -1)
 
+        # if (pad_size := 8 - freqs_cos.shape[1] % 8) != 8:
+        #     b, s, n, d = freqs_cos.shape
+        #     freqs_cos = torch.cat([freqs_cos, freqs_cos.new_ones(b, pad_size, n, d)], dim=1)
+        #     freqs_sin = torch.cat([freqs_sin, freqs_sin.new_ones(b, pad_size, n, d)], dim=1)
+
         return freqs_cos, freqs_sin
 
 
@@ -536,7 +781,7 @@ class WanTransformerBlock(nn.Module):
             dim_head=dim // num_heads,
             eps=eps,
             cross_attention_dim_head=None,
-            processor=WanAttnProcessor(),
+            processor=WanAttnProcessorSP(),
         )
 
         # 2. Cross-attention
@@ -547,7 +792,7 @@ class WanTransformerBlock(nn.Module):
             eps=eps,
             added_kv_proj_dim=added_kv_proj_dim,
             cross_attention_dim_head=dim // num_heads,
-            processor=WanAttnProcessorNPU(),
+            processor=WanAttnProcessorCross(),
         )
         self.norm2 = FP32LayerNorm(dim, eps, elementwise_affine=True) if cross_attn_norm else nn.Identity()
 
@@ -655,9 +900,9 @@ class WanTransformer3DModel(
         "blocks.0": {
             "hidden_states": ContextParallelInput(split_dim=1, expected_dims=3, split_output=False),
         },
-        "blocks.*": {
-            "encoder_hidden_states": ContextParallelInput(split_dim=1, expected_dims=3, split_output=False),
-        },
+        # "blocks.*": {
+        #     "encoder_hidden_states": ContextParallelInput(split_dim=1, expected_dims=3, split_output=False),
+        # },
         "proj_out": ContextParallelOutput(gather_dim=1, expected_dims=3),
     }
 
@@ -755,6 +1000,10 @@ class WanTransformer3DModel(
         hidden_states = self.patch_embedding(hidden_states)
         hidden_states = hidden_states.flatten(2).transpose(1, 2)
 
+        # if (pad_size := (8 - hidden_states.shape[1] % 8) % 8) != 0:
+        #     b, s, d = hidden_states.shape
+        #     hidden_states = torch.cat([hidden_states, hidden_states.new_zeros(b, pad_size, d)], dim=1)
+
         # timestep shape: batch_size, or batch_size, seq_len (wan 2.2 ti2v)
         if timestep.ndim == 2:
             ts_seq_len = timestep.shape[1]
@@ -804,6 +1053,7 @@ class WanTransformer3DModel(
 
         hidden_states = (self.norm_out(hidden_states.float()) * (1 + scale) + shift).type_as(hidden_states)
         hidden_states = self.proj_out(hidden_states)
+        # hidden_states = hidden_states[:, :-pad_size, :]
 
         hidden_states = hidden_states.reshape(
             batch_size, post_patch_num_frames, post_patch_height, post_patch_width, p_t, p_h, p_w, -1

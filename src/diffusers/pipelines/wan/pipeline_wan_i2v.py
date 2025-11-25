@@ -359,10 +359,10 @@ class WanImageToVideoPipeline(DiffusionPipeline, WanLoraLoaderMixin):
 
         if getattr(getattr(self.transformer, "_parallel_config", None), "context_parallel_config", None) is not None:
             mesh_size = self.transformer._parallel_config.context_parallel_config._flattened_mesh.size()
-            mod_size = 16 * mesh_size
-            if height % mod_size != 0 or width % mod_size != 0:
+            mod_size = 16 * 16 * mesh_size
+            if (height * width ) % mod_size != 0:
                 raise ValueError(
-                    f"`height` and `width` have to be divisible by 16 * {mesh_size} " \
+                    f"The product of `height` and `width` have to be divisible by 16 * 16 * {mesh_size} " \
                     f"when enable context parallel, but are {height} and {width}."
                 )
 
